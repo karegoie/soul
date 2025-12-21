@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashMap;
-use log::{debug, info, warn};
+use log::{debug, info};
 use needletail::sequence::Sequence;
 use pathfinding::prelude::astar;
 use rayon::prelude::*;
@@ -530,12 +530,12 @@ fn main() -> Result<()> {
                             merged_ok = true;
                             break;
                         }
-                        Err(e) => warn!("Alignment failed between {} and {}: {}", src, cand.target_id, e),
+                        Err(e) => debug!("Alignment failed between {} and {}: {}", src, cand.target_id, e),
                     }
                 }
 
                 if !merged_ok {
-                    warn!("No mergeable edge from {}; stopping planned path early", src);
+                    debug!("No mergeable edge from {}; stopping planned path early", src);
                     break;
                 }
             }
@@ -562,7 +562,7 @@ fn main() -> Result<()> {
                         extended = true;
                         break;
                     }
-                    Err(e) => warn!("Forward extension failed {} -> {}: {}", contig_end, cand.target_id, e),
+                    Err(e) => debug!("Forward extension failed {} -> {}: {}", contig_end, cand.target_id, e),
                 }
             }
 
@@ -590,7 +590,7 @@ fn main() -> Result<()> {
                         extended = true;
                         break;
                     }
-                    Err(e) => warn!("Backward extension failed {} -> {}: {}", src, contig_start, e),
+                    Err(e) => debug!("Backward extension failed {} -> {}: {}", src, contig_start, e),
                 }
             }
 
