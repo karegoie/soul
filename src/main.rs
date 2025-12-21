@@ -42,11 +42,11 @@ struct Args {
     tolerance: u32,
 
     /// Merge scoring: match bonus (per bp)
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 1)]
     merge_match_bonus: isize,
 
     /// Merge scoring: mismatch penalty (per bp, positive number)
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 2)]
     merge_mismatch_penalty: isize,
 
     /// Minimum identity for accepting an overlap merge (0.0-1.0)
@@ -58,8 +58,12 @@ struct Args {
     merge_max_shift: usize,
 
     /// Minimum overlap length to consider during merge
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 10)]
     merge_min_overlap: usize,
+
+    /// Cap outgoing edges per node (keeps top overlaps)
+    #[arg(long, default_value_t = 32)]
+    max_edges_per_node: usize,
 }
 
 // ---------------------------------------------------------
@@ -367,6 +371,8 @@ fn main() -> Result<()> {
     // Adjacency List: NodeID -> List of Edges
     let graph = Arc::new(DashMap::new());
 
+    let max_edges_per_node = args.max_edges_per_node;
+
     processed_reads.par_iter().for_each(|read_a| {
         let mut candidates = HashMap::new();
         // Index Query
@@ -386,8 +392,8 @@ fn main() -> Result<()> {
         }
 
         // Verify & Add Edges
+        let mut edges = Vec::new();
         for ((bid, strand_b), score) in candidates {
-            if score < 1 { continue; } // Yeast-scale: allow more edges, rely on overlap/identity filters later
             let read_b = &processed_reads[bid];
             
             let mut best_overlap = 0;
@@ -395,7 +401,7 @@ fn main() -> Result<()> {
                 if let Some(len) = check_fuzzy_overlap(
                     &read_a.rhythms[ch][&Strand::Forward],
                     &read_b.rhythms[ch][&strand_b],
-                    3, // Moderate interval requirement
+                    2, // Looser interval requirement for short reads
                     args.tolerance
                 ) {
                     if len > best_overlap { best_overlap = len; }
@@ -403,13 +409,18 @@ fn main() -> Result<()> {
             }
 
             if best_overlap > 0 {
-                // Add directed edge
-                graph.entry(read_a.id).or_insert_with(Vec::new).push(OverlapEdge {
+                edges.push(OverlapEdge {
                     target_id: bid,
                     overlap_len: best_overlap,
                     score,
                 });
             }
+        }
+
+        if !edges.is_empty() {
+            edges.sort_by(|a, b| b.overlap_len.cmp(&a.overlap_len).then(b.score.cmp(&a.score)));
+            edges.truncate(max_edges_per_node);
+            graph.insert(read_a.id, edges);
         }
     });
 
@@ -418,6 +429,18 @@ fn main() -> Result<()> {
     // ------------------------------------------------------
     info!("Phase 4: Layout & Pathfinding...");
     info!("Graph nodes: {}", graph.len());
+
+    let mut reverse_graph: HashMap<usize, Vec<(usize, OverlapEdge)>> = HashMap::new();
+    for entry in graph.iter() {
+        let src = *entry.key();
+        for e in entry.value().iter() {
+            reverse_graph
+                .entry(e.target_id)
+                .or_insert_with(Vec::new)
+                .push((src, e.clone()));
+        }
+    }
+
     let merge_params = MergeParams {
         match_bonus: args.merge_match_bonus,
         mismatch_penalty: args.merge_mismatch_penalty,
@@ -427,8 +450,8 @@ fn main() -> Result<()> {
     };
 
     let mut visited = HashSet::new();
-    let mut contig_idx = 0usize;
     let mut total_bases = 0usize;
+    let mut contigs: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut output = BufWriter::new(File::create(&args.output)?);
 
     while visited.len() < reads.len() {
@@ -476,33 +499,116 @@ fn main() -> Result<()> {
 
         // Consensus & Output for this contig
         let mut contig_seq = reads[path[0]].seq.clone();
+        visited.insert(path[0]);
 
+        // Follow planned path, but retry with next-best outgoing edge if merge fails
+        let mut contig_start = path[0];
+        let mut contig_end = path[0];
         for win in path.windows(2) {
-            let prev = &reads[win[0]];
-            let curr = &reads[win[1]];
+            let src = win[0];
+            if let Some(edges) = graph.get(&src) {
+                let mut candidates: Vec<OverlapEdge> = edges
+                    .iter()
+                    .filter(|e| !visited.contains(&e.target_id))
+                    .cloned()
+                    .collect();
 
-            // Retrieve overlap info from graph
-            let edges = graph.get(&win[0]).unwrap();
-            let edge = edges.iter().find(|e| e.target_id == win[1]).unwrap();
+                // Prefer the planned target first
+                candidates.sort_by(|a, b| {
+                    let a_pref = (a.target_id != win[1]) as usize;
+                    let b_pref = (b.target_id != win[1]) as usize;
+                    a_pref.cmp(&b_pref).then_with(|| b.overlap_len.cmp(&a.overlap_len))
+                });
 
-            match align_and_merge(&contig_seq, &curr.seq, edge.overlap_len, &merge_params) {
-                Ok(merged) => contig_seq = merged,
-                Err(e) => warn!("Alignment failed between {} and {}: {}", prev.id, curr.id, e),
+                let mut merged_ok = false;
+                for cand in candidates {
+                    match align_and_merge(&contig_seq, &reads[cand.target_id].seq, cand.overlap_len, &merge_params) {
+                        Ok(merged) => {
+                            contig_seq = merged;
+                            visited.insert(cand.target_id);
+                            contig_end = cand.target_id;
+                            merged_ok = true;
+                            break;
+                        }
+                        Err(e) => warn!("Alignment failed between {} and {}: {}", src, cand.target_id, e),
+                    }
+                }
+
+                if !merged_ok {
+                    warn!("No mergeable edge from {}; stopping planned path early", src);
+                    break;
+                }
             }
         }
 
-        contig_idx += 1;
-        total_bases += contig_seq.len();
-        writeln!(output, ">Soul_Contig_{} length={}", contig_idx, contig_seq.len())?;
-        output.write_all(&contig_seq)?;
-        output.write_all(b"\n")?;
+        // Greedy forward extension from current end
+        loop {
+            let Some(edges) = graph.get(&contig_end) else { break; };
+            let mut candidates: Vec<OverlapEdge> = edges
+                .iter()
+                .filter(|e| !visited.contains(&e.target_id))
+                .cloned()
+                .collect();
+            if candidates.is_empty() { break; }
+            candidates.sort_by(|a, b| b.overlap_len.cmp(&a.overlap_len).then(b.score.cmp(&a.score)));
 
-        for nid in path {
-            visited.insert(nid);
+            let mut extended = false;
+            for cand in candidates {
+                match align_and_merge(&contig_seq, &reads[cand.target_id].seq, cand.overlap_len, &merge_params) {
+                    Ok(merged) => {
+                        contig_seq = merged;
+                        visited.insert(cand.target_id);
+                        contig_end = cand.target_id;
+                        extended = true;
+                        break;
+                    }
+                    Err(e) => warn!("Forward extension failed {} -> {}: {}", contig_end, cand.target_id, e),
+                }
+            }
+
+            if !extended { break; }
         }
+
+        // Greedy backward extension using incoming edges
+        loop {
+            let Some(incoming) = reverse_graph.get(&contig_start) else { break; };
+            let mut candidates: Vec<(usize, OverlapEdge)> = incoming
+                .iter()
+                .filter(|(src, _)| !visited.contains(src))
+                .cloned()
+                .collect();
+            if candidates.is_empty() { break; }
+            candidates.sort_by(|a, b| b.1.overlap_len.cmp(&a.1.overlap_len).then(b.1.score.cmp(&a.1.score)));
+
+            let mut extended = false;
+            for (src, edge) in candidates {
+                match align_and_merge(&reads[src].seq, &contig_seq, edge.overlap_len, &merge_params) {
+                    Ok(merged) => {
+                        contig_seq = merged;
+                        visited.insert(src);
+                        contig_start = src;
+                        extended = true;
+                        break;
+                    }
+                    Err(e) => warn!("Backward extension failed {} -> {}: {}", src, contig_start, e),
+                }
+            }
+
+            if !extended { break; }
+        }
+
+        total_bases += contig_seq.len();
+        contigs.push((contig_seq.len(), contig_seq));
     }
 
-    info!("Assembly complete: {} contigs, total {} bp -> {:?}", contig_idx, total_bases, args.output);
+    contigs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (idx, (len, seq)) in contigs.iter().enumerate() {
+        writeln!(output, ">Soul_Contig_{} length={}", idx + 1, len)?;
+        output.write_all(seq)?;
+        output.write_all(b"\n")?;
+    }
+
+    info!("Assembly complete: {} contigs, total {} bp -> {:?}", contigs.len(), total_bases, args.output);
 
     Ok(())
 }
