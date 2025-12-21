@@ -50,7 +50,7 @@ struct Args {
     merge_mismatch_penalty: isize,
 
     /// Minimum identity for accepting an overlap merge (0.0-1.0)
-    #[arg(long, default_value_t = 0.85)]
+    #[arg(long, default_value_t = 0.70)]
     merge_min_identity: f64,
 
     /// Allowed shift around the estimated overlap when scoring
