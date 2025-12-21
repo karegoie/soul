@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use needletail::parse_fastx_file;
 use needletail::sequence::Sequence;
 use pathfinding::prelude::astar;
 use rayon::prelude::*;
@@ -12,6 +11,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use needletail::parse_fastx_file;
 
 // ---------------------------------------------------------
 // CLI Arguments
@@ -204,6 +204,7 @@ fn extract_rhythm(seq: &[u8], kmer: &[u8]) -> RhythmVector {
     }
     dists
 }
+
 
 fn check_fuzzy_overlap(
     vec_a: &[u32], 
