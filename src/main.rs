@@ -1,45 +1,65 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashMap;
-use itertools::Itertools;
-use log::{info, warn};
+use log::{debug, info, warn};
 use needletail::parse_fastx_file;
 use needletail::sequence::Sequence;
+use pathfinding::prelude::astar;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-/// Soul: T2T Haplotype Phased Assembler
-/// 
-/// A proof-of-concept assembler that uses "Rhythm" (inter-kmer distances)
-/// to resolve repetitive regions and phase haplotypes.
+// ---------------------------------------------------------
+// CLI Arguments
+// ---------------------------------------------------------
+
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about)]
 struct Args {
-    /// Input FASTQ file path (HiFi reads recommended)
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Output GFA file path
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Number of threads to use for parallel processing
     #[arg(short, long, default_value_t = 8)]
     threads: usize,
 
-    /// Minimum overlapping rhythm length (number of intervals, not bp)
-    #[arg(short, long, default_value_t = 15)]
-    min_rhythm_len: usize,
+    /// Number of "Rhythmers" (indexing channels) to select
+    #[arg(long, default_value_t = 64)]
+    num_rhythmers: usize,
 
-    /// Fuzzy matching tolerance in bp.
-    /// Allows small differences between intervals (e.g., indels).
-    /// If tolerance is 2, distance 2000 matches 1998-2002.
-    #[arg(short, long, default_value_t = 2)]
+    /// K-mer size for Rhythmer selection (13-17 recommended)
+    #[arg(long, default_value_t = 15)]
+    k: usize,
+
+    /// Fuzzy matching tolerance (bp)
+    #[arg(long, default_value_t = 5)]
     tolerance: u32,
+
+    /// Merge scoring: match bonus (per bp)
+    #[arg(long, default_value_t = 2)]
+    merge_match_bonus: isize,
+
+    /// Merge scoring: mismatch penalty (per bp, positive number)
+    #[arg(long, default_value_t = 3)]
+    merge_mismatch_penalty: isize,
+
+    /// Minimum identity for accepting an overlap merge (0.0-1.0)
+    #[arg(long, default_value_t = 0.85)]
+    merge_min_identity: f64,
+
+    /// Allowed shift around the estimated overlap when scoring
+    #[arg(long, default_value_t = 150)]
+    merge_max_shift: usize,
+
+    /// Minimum overlap length to consider during merge
+    #[arg(long, default_value_t = 60)]
+    merge_min_overlap: usize,
 }
 
 // ---------------------------------------------------------
@@ -52,307 +72,436 @@ enum Strand {
     Reverse,
 }
 
-/// A "Rhythm" is a sequence of distances between specific k-mers.
-/// We use u32 to save memory (supports distances up to ~4Gb).
 type RhythmVector = Vec<u32>;
 
-/// Holds the rhythm profiles for a single read.
-#[derive(Debug)]
+struct MergeParams {
+    match_bonus: isize,
+    mismatch_penalty: isize,
+    min_identity: f64,
+    max_shift: usize,
+    min_overlap: usize,
+}
+
+fn sample_variance(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n < 2 {
+        return f64::MAX;
+    }
+
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let sum_sq: f64 = values.iter().map(|v| (v - mean).powi(2)).sum();
+    sum_sq / (n as f64 - 1.0)
+}
+
+#[derive(Debug, Clone)]
+struct GenomicRead {
+    id: usize,
+    #[allow(dead_code)]
+    name: String,
+    seq: Vec<u8>, // Keep sequence for Consensus step
+}
+
 struct ProcessedRead {
     id: usize,
-    name: String,
-    len: usize,
-    // Maps: [Channel_Index] -> [Strand] -> RhythmVector
-    // We store pre-calculated rhythms for both Forward and Reverse strands
-    // to enable efficient all-vs-all comparison.
+    // [Channel_Index][Strand] -> RhythmVector
     rhythms: Vec<HashMap<Strand, RhythmVector>>,
 }
 
-/// The Inverted Index Key: (Channel_ID, Distance_1, Distance_2)
-/// We index pairs of distances to create a more unique signature than single distances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct IndexKey {
-    channel_id: u8,
+    channel_id: u16,
     d1: u32,
     d2: u32,
 }
 
-// ---------------------------------------------------------
-// Core Logic: Rhythm Extraction & Comparison
-// ---------------------------------------------------------
-
-/// Generate all 24 permutations of "ACGT" (4-mers) to serve as anchor channels.
-fn generate_channels() -> Vec<Vec<u8>> {
-    let bases = vec![b'A', b'C', b'G', b'T'];
-    bases.into_iter().permutations(4).collect()
+/// Represents an edge in the Overlap Graph
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverlapEdge {
+    target_id: usize,
+    overlap_len: usize,
+    score: usize,
 }
 
-/// Scans a sequence for a specific k-mer and calculates distances between occurrences.
-fn extract_rhythm_for_channel(seq: &[u8], kmer: &[u8]) -> RhythmVector {
-    let mut positions = Vec::new();
+// ---------------------------------------------------------
+// 1. Rhythmer Selection (The "Recurrentizer" Logic)
+// ---------------------------------------------------------
+
+/// Calculates distance variance for k-mers to find the most "regular" ones.
+fn select_rhythmers(
+    reads: &[GenomicRead],
+    k: usize,
+    top_n: usize,
+) -> Vec<Vec<u8>> {
+    info!("Phase 1: Rhythmer Selection (Scanning for regular patterns...)");
     
-    // Naive sliding window search.
-    // For production, SIMD or Aho-Corasick would be faster.
+    // 1. Map k-mer -> List of Interval Distances
+    // We use a subset of reads to save time if dataset is huge
+    let sample_size = std::cmp::min(reads.len(), 5000);
+    let sample_reads = &reads[..sample_size];
+
+    let kmer_stats = DashMap::new(); // Parallel collection
+
+    sample_reads.par_iter().for_each(|read| {
+        let mut last_pos: HashMap<Vec<u8>, u32> = HashMap::new();
+        
+        for (i, win) in read.seq.windows(k).enumerate() {
+            let kmer = win.to_vec();
+            if let Some(prev_i) = last_pos.get(&kmer) {
+                let dist = (i as u32) - prev_i;
+                kmer_stats.entry(kmer.clone())
+                    .or_insert_with(Vec::new)
+                    .push(dist as f64);
+            }
+            last_pos.insert(kmer, i as u32);
+        }
+    });
+
+    info!("Analyzed unique k-mers. Calculating variance...");
+
+    // 2. Calculate Variance & Select
+    let mut candidates: Vec<(Vec<u8>, f64, usize)> = kmer_stats
+        .into_iter()
+        .map(|(kmer, dists)| {
+            let count = dists.len();
+            if count < 5 { return (kmer, f64::MAX, count); } // Ignore rare kmers
+            let variance = sample_variance(&dists);
+            (kmer, variance, count)
+        })
+        .filter(|(_, var, _)| *var >= 0.0) // Filter invalid
+        .collect();
+
+    // Sort by Variance (Lower is more regular/rhythmic)
+    candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+    // Log top candidates
+    for i in 0..std::cmp::min(5, candidates.len()) {
+        debug!("Top Rhythmer #{}: {:?} (Var: {:.2}, Count: {})", 
+            i, String::from_utf8_lossy(&candidates[i].0), candidates[i].1, candidates[i].2);
+    }
+
+    candidates.into_iter()
+        .take(top_n)
+        .map(|(kmer, _, _)| kmer)
+        .collect()
+}
+
+// ---------------------------------------------------------
+// 2. Indexing & Overlap (The "Soul" Logic)
+// ---------------------------------------------------------
+
+fn extract_rhythm(seq: &[u8], kmer: &[u8]) -> RhythmVector {
+    let mut positions = Vec::new();
     for i in 0..seq.len().saturating_sub(kmer.len()) {
         if &seq[i..i + kmer.len()] == kmer {
             positions.push(i as u32);
         }
     }
-
-    // Convert absolute positions to relative delta distances.
-    // e.g., Positions: [100, 300, 305] -> Distances: [200, 5]
-    let mut distances = Vec::new();
+    let mut dists = Vec::new();
     if positions.len() >= 2 {
         for w in positions.windows(2) {
-            distances.push(w[1] - w[0]);
+            dists.push(w[1] - w[0]);
         }
     }
-    distances
+    dists
 }
 
-/// Checks if the suffix of Vector A matches the prefix of Vector B.
-/// Uses fuzzy logic to tolerate small indels.
-/// 
-/// Returns: Option<(Matched_Interval_Count, Physical_Overlap_Length_BP)>
-fn check_vector_overlap_fuzzy(
+fn check_fuzzy_overlap(
     vec_a: &[u32], 
     vec_b: &[u32], 
-    min_len: usize,
+    min_len: usize, 
     tolerance: u32
-) -> Option<(usize, usize)> {
-    if vec_a.len() < min_len || vec_b.len() < min_len {
-        return None;
-    }
-    
-    // Determine the maximum possible overlap length in intervals
+) -> Option<usize> {
+    if vec_a.len() < min_len || vec_b.len() < min_len { return None; }
     let max_check = std::cmp::min(vec_a.len(), vec_b.len());
-    
-    // Iterate from longest possible overlap down to minimum required length
+
+    // Check from longest overlap down
     'outer: for len in (min_len..=max_check).rev() {
         let suffix_a = &vec_a[vec_a.len() - len..];
         let prefix_b = &vec_b[..len];
-        
-        // Element-wise fuzzy comparison
+
+        // Mean distance calculation for precise physical length
+        let mut total_bp = 0;
         for (da, db) in suffix_a.iter().zip(prefix_b.iter()) {
-            if da.abs_diff(*db) > tolerance {
-                continue 'outer; // Mismatch found, try next length
-            }
+            if da.abs_diff(*db) > tolerance { continue 'outer; }
+            total_bp += (da + db) / 2;
         }
-
-        // If we reach here, the vectors match within tolerance.
-        // Calculate the exact physical distance by summing the intervals.
-        // We use the average of A and B for each interval to smooth out indels.
-        let overlap_bp: u32 = suffix_a.iter()
-            .zip(prefix_b.iter())
-            .map(|(a, b)| (a + b) / 2) 
-            .sum();
-
-        return Some((len, overlap_bp as usize));
+        return Some(total_bp as usize);
     }
     None
 }
 
 // ---------------------------------------------------------
-// Main Execution Flow
+// 3. Consensus (Block Aligner)
+// ---------------------------------------------------------
+
+/// Aligns two overlapping sequences and merges them.
+/// Returns the consensus sequence.
+fn align_and_merge(
+    seq_a: &[u8], 
+    seq_b: &[u8], 
+    approx_overlap: usize,
+    params: &MergeParams,
+) -> Result<Vec<u8>> {
+    let max_shift = params.max_shift;
+    let mut best: Option<(isize, usize, usize, usize)> = None; // (score, ovlp, matches, mismatches)
+
+    let min_ovlp = approx_overlap.saturating_sub(max_shift).max(params.min_overlap);
+    let max_ovlp = approx_overlap + max_shift;
+
+    for ovlp in min_ovlp..=max_ovlp {
+        let ovlp = ovlp.min(seq_a.len()).min(seq_b.len());
+        if ovlp == 0 {
+            continue;
+        }
+
+        let start_a = seq_a.len() - ovlp;
+        let (mut matches, mut mismatches) = (0usize, 0usize);
+        for (a, b) in seq_a[start_a..].iter().zip(&seq_b[..ovlp]) {
+            if a == b {
+                matches += 1;
+            } else {
+                mismatches += 1;
+            }
+        }
+
+        let score = params.match_bonus * matches as isize - params.mismatch_penalty * mismatches as isize;
+
+        if let Some((best_score, best_ovlp, _, _)) = best {
+            if score > best_score || (score == best_score && ovlp > best_ovlp) {
+                best = Some((score, ovlp, matches, mismatches));
+            }
+        } else {
+            best = Some((score, ovlp, matches, mismatches));
+        }
+    }
+
+    let (_score, overlap_len, matches, _mismatches) = best.ok_or_else(|| anyhow::anyhow!("No overlap found"))?;
+    if overlap_len == 0 {
+        return Err(anyhow::anyhow!("Zero-length overlap"));
+    }
+
+    let identity = matches as f64 / overlap_len as f64;
+    if identity < params.min_identity { // reject very noisy overlaps
+        return Err(anyhow::anyhow!("Low-identity overlap"));
+    }
+
+    let mut merged = seq_a.to_vec();
+    if overlap_len < seq_b.len() {
+        merged.extend_from_slice(&seq_b[overlap_len..]);
+    }
+
+    Ok(merged)
+}
+
+// ---------------------------------------------------------
+// Main Pipeline
 // ---------------------------------------------------------
 
 fn main() -> Result<()> {
-    // Initialize logger (default level: info)
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let args = Args::parse();
     
-    info!("Starting Soul Assembler v0.2.0");
-    info!("Config: Input={:?}, Threads={}, MinRhythm={}, Tolerance={}", 
-        args.input, args.threads, args.min_rhythm_len, args.tolerance);
-
-    // Setup thread pool
     rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global()?;
-
-    // 1. Generate Channels
-    // We use 24 permutations of ACGT to create a "barcode" for the genome.
-    let channels = generate_channels();
-    info!("Generated {} rhythm channels (ACGT permutations)", channels.len());
-
-    // 2. Load Reads and Extract Rhythms
-    info!("Loading reads and extracting rhythm vectors...");
-    let mut reader = parse_fastx_file(&args.input).context("Failed to open input FASTQ")?;
-    let mut raw_records = Vec::new();
     
+    info!("Soul v0.3: Starting Rhythmer-based OLC Assembly");
+
+    // ------------------------------------------------------
+    // Step 0: Load Reads
+    // ------------------------------------------------------
+    let mut reader = parse_fastx_file(&args.input).context("Input read error")?;
+    let mut reads = Vec::new();
     while let Some(record) = reader.next() {
-        let seqrec = record?;
-        // We must own the data to process in parallel later
-        raw_records.push((
-            String::from_utf8_lossy(seqrec.id()).to_string(),
-            seqrec.seq().into_owned(),
-        ));
+        let r = record?;
+        reads.push(GenomicRead {
+            id: reads.len(),
+            name: String::from_utf8_lossy(r.id()).to_string(),
+            seq: r.seq().into_owned(),
+        });
     }
+    info!("Loaded {} reads.", reads.len());
 
-    if raw_records.is_empty() {
-        warn!("Input file is empty. Exiting.");
-        return Ok(());
-    }
+    // ------------------------------------------------------
+    // Step 1: Select Rhythmers (Data-Driven Channels)
+    // ------------------------------------------------------
+    let rhythmer_kmers = select_rhythmers(&reads, args.k, args.num_rhythmers);
+    info!("Selected {} optimal Rhythmers.", rhythmer_kmers.len());
 
-    // Parallel processing of reads
-    let processed_reads: Vec<ProcessedRead> = raw_records
-        .into_par_iter()
-        .enumerate()
-        .map(|(idx, (name, seq))| {
-            let rc_seq = seq.reverse_complement();
-            let mut read_rhythms = Vec::with_capacity(channels.len());
-
-            for channel_kmer in &channels {
+    // ------------------------------------------------------
+    // Step 2: Extract Rhythms & Build Index
+    // ------------------------------------------------------
+    info!("Phase 2: Indexing Rhythms...");
+    let processed_reads: Vec<ProcessedRead> = reads.par_iter()
+        .map(|read| {
+            let rc_seq = read.seq.reverse_complement();
+            let mut rhythms = Vec::new();
+            
+            for kmer in &rhythmer_kmers {
                 let mut map = HashMap::new();
-                // Extract rhythm for Forward strand
-                map.insert(Strand::Forward, extract_rhythm_for_channel(&seq, channel_kmer));
-                // Extract rhythm for Reverse strand (essential for detecting RC overlaps)
-                map.insert(Strand::Reverse, extract_rhythm_for_channel(&rc_seq, channel_kmer));
-                read_rhythms.push(map);
+                map.insert(Strand::Forward, extract_rhythm(&read.seq, kmer));
+                map.insert(Strand::Reverse, extract_rhythm(&rc_seq, kmer));
+                rhythms.push(map);
             }
-
-            ProcessedRead {
-                id: idx,
-                name,
-                len: seq.len(),
-                rhythms: read_rhythms,
-            }
+            ProcessedRead { id: read.id, rhythms }
         })
         .collect();
 
-    info!("Successfully processed {} reads.", processed_reads.len());
-
-    // 3. Build Inverted Index
-    // We index consecutive distance pairs (d1, d2) to quickly find candidate overlaps.
-    info!("Building inverted index based on distance tuples...");
-    
-    // Key: (Channel, Dist1, Dist2), Value: List of (ReadID, Strand, Offset)
     let index = DashMap::new();
-
-    processed_reads.par_iter().for_each(|read| {
-        for (ch_idx, rhythm_map) in read.rhythms.iter().enumerate() {
-            for (&strand, vec) in rhythm_map {
+    processed_reads.par_iter().for_each(|pr| {
+        for (ch_idx, map) in pr.rhythms.iter().enumerate() {
+            for (&strand, vec) in map {
                 if vec.len() < 2 { continue; }
-                
-                // Sliding window of size 2 over the rhythm vector
                 for (i, w) in vec.windows(2).enumerate() {
-                    let key = IndexKey {
-                        channel_id: ch_idx as u8,
-                        d1: w[0],
-                        d2: w[1],
-                    };
-                    // Insert into concurrent hashmap
-                    index.entry(key).or_insert_with(Vec::new).push((read.id, strand, i));
+                    let key = IndexKey { channel_id: ch_idx as u16, d1: w[0], d2: w[1] };
+                    index.entry(key).or_insert_with(Vec::new).push((pr.id, strand, i));
                 }
             }
         }
     });
+    info!("Index built. Size: {}", index.len());
 
-    info!("Index construction complete. Unique rhythm motifs: {}", index.len());
-
-    // 4. Overlap Detection
-    info!("Querying index and detecting overlaps...");
-    
-    let overlap_count = AtomicUsize::new(0);
-    // Stores edges: Key=(ReadA_ID, ReadB_ID), Value=(Overlap_BP, DirA, DirB)
-    let edges = DashMap::new();
+    // ------------------------------------------------------
+    // Step 3: Build Overlap Graph
+    // ------------------------------------------------------
+    info!("Phase 3: Building Overlap Graph...");
+    // Adjacency List: NodeID -> List of Edges
+    let graph = Arc::new(DashMap::new());
 
     processed_reads.par_iter().for_each(|read_a| {
-        let mut candidates: HashMap<(usize, Strand), usize> = HashMap::new();
-
-        // Step 4a: Candidate Search
-        // We only use the Forward strand of Read A to query the index.
-        for (ch_idx, rhythm_map) in read_a.rhythms.iter().enumerate() {
-            let vec_a = &rhythm_map[&Strand::Forward];
+        let mut candidates = HashMap::new();
+        // Index Query
+        for (ch_idx, map) in read_a.rhythms.iter().enumerate() {
+            let vec_a = &map[&Strand::Forward];
             if vec_a.len() < 2 { continue; }
-
             for w in vec_a.windows(2) {
-                // Exact match lookup for seeds (speed optimization)
-                let key = IndexKey {
-                    channel_id: ch_idx as u8,
-                    d1: w[0],
-                    d2: w[1],
-                };
-
+                let key = IndexKey { channel_id: ch_idx as u16, d1: w[0], d2: w[1] };
                 if let Some(hits) = index.get(&key) {
-                    for &(read_b_id, strand_b, _) in hits.value() {
-                        // Avoid self-matches
-                        if read_a.id == read_b_id { continue; }
-                        *candidates.entry((read_b_id, strand_b)).or_default() += 1;
+                    for &(bid, strand_b, _) in hits.value() {
+                        if read_a.id != bid {
+                            *candidates.entry((bid, strand_b)).or_insert(0) += 1;
+                        }
                     }
                 }
             }
         }
 
-        // Step 4b: Verification & Alignment
-        for ((read_b_id, strand_b), score) in candidates {
-            // Filter weak candidates (heuristic threshold)
-            if score < 5 { continue; }
+        // Verify & Add Edges
+        for ((bid, strand_b), score) in candidates {
+            if score < 1 { continue; } // Yeast-scale: allow more edges, rely on overlap/identity filters later
+            let read_b = &processed_reads[bid];
             
-            // Canonical ordering to avoid duplicate edges (A-B and B-A)
-            if read_a.id >= read_b_id { continue; }
-
-            let read_b = &processed_reads[read_b_id];
-            let mut max_bp_len = 0;
-            
-            // Check all channels to find the strongest support for this overlap
-            for ch_idx in 0..channels.len() {
-                let vec_a = &read_a.rhythms[ch_idx][&Strand::Forward];
-                let vec_b = &read_b.rhythms[ch_idx][&strand_b];
-
-                // Perform fuzzy matching logic
-                if let Some((_rhythm_cnt, bp_len)) = check_vector_overlap_fuzzy(
-                    vec_a, 
-                    vec_b, 
-                    args.min_rhythm_len, 
+            let mut best_overlap = 0;
+            for ch in 0..rhythmer_kmers.len() {
+                if let Some(len) = check_fuzzy_overlap(
+                    &read_a.rhythms[ch][&Strand::Forward],
+                    &read_b.rhythms[ch][&strand_b],
+                    3, // Moderate interval requirement
                     args.tolerance
                 ) {
-                    if bp_len > max_bp_len {
-                        max_bp_len = bp_len;
-                    }
+                    if len > best_overlap { best_overlap = len; }
                 }
             }
 
-            if max_bp_len > 0 {
-                // Determine orientation characters for GFA
-                // Read A is always Forward (+).
-                // If matched Strand B is Forward, it implies A+ overlaps B+.
-                // If matched Strand B is Reverse, it implies A+ overlaps B-.
-                let dir_b = if strand_b == Strand::Forward { '+' } else { '-' };
-                
-                edges.insert((read_a.id, read_b_id), (max_bp_len, '+', dir_b));
-                overlap_count.fetch_add(1, Ordering::Relaxed);
+            if best_overlap > 0 {
+                // Add directed edge
+                graph.entry(read_a.id).or_insert_with(Vec::new).push(OverlapEdge {
+                    target_id: bid,
+                    overlap_len: best_overlap,
+                    score,
+                });
             }
         }
     });
 
-    info!("Overlap detection complete. Found {} valid edges.", overlap_count.load(Ordering::Relaxed));
+    // ------------------------------------------------------
+    // Step 4: Layout (A* / Greedy Extension)
+    // ------------------------------------------------------
+    info!("Phase 4: Layout & Pathfinding...");
+    info!("Graph nodes: {}", graph.len());
+    let merge_params = MergeParams {
+        match_bonus: args.merge_match_bonus,
+        mismatch_penalty: args.merge_mismatch_penalty,
+        min_identity: args.merge_min_identity,
+        max_shift: args.merge_max_shift,
+        min_overlap: args.merge_min_overlap,
+    };
 
-    // 5. Write Output (GFA Format)
-    info!("Writing GFA output to {:?}", args.output);
-    let f = File::create(&args.output).context("Failed to create output file")?;
-    let mut writer = BufWriter::new(f);
+    let mut visited = HashSet::new();
+    let mut contig_idx = 0usize;
+    let mut total_bases = 0usize;
+    let mut output = BufWriter::new(File::create(&args.output)?);
 
-    writeln!(writer, "H\tVN:Z:1.0")?;
+    while visited.len() < reads.len() {
+        // Pick next seed: longest unvisited read; prefer one present in the graph
+        let seed_opt = reads
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| !visited.contains(id))
+            .max_by_key(|(id, r)| {
+                let in_graph = graph.contains_key(id);
+                (in_graph as usize, r.seq.len())
+            });
 
-    // Write Segments (Nodes)
-    for r in &processed_reads {
-        // GFA Segment: S <Name> <Sequence>
-        // We use '*' for sequence to keep GFA small, but actual seq can be added if needed.
-        writeln!(writer, "S\t{}\t*\tLN:i:{}", r.name, r.len)?;
+        let Some((seed_id, seed_read)) = seed_opt else { break; };
+
+        let max_read_len = seed_read.seq.len() * 2; // cost inversion base
+
+        let result = astar(
+            &seed_id,
+            |&node_id| {
+                if let Some(entry) = graph.get(&node_id) {
+                    entry
+                        .iter()
+                        .filter(|e| !visited.contains(&e.target_id))
+                        .map(|e| {
+                            let cost = max_read_len.saturating_sub(e.overlap_len) as i32;
+                            (e.target_id, cost)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            },
+            |&_node_id| 0, // heuristic
+            |&node_id| {
+                let has_unvisited = graph
+                    .get(&node_id)
+                    .map(|edges| edges.iter().any(|e| !visited.contains(&e.target_id)))
+                    .unwrap_or(false);
+                !has_unvisited
+            },
+        );
+
+        let path: Vec<usize> = if let Some((p, _)) = result { p } else { vec![seed_id] };
+
+        // Consensus & Output for this contig
+        let mut contig_seq = reads[path[0]].seq.clone();
+
+        for win in path.windows(2) {
+            let prev = &reads[win[0]];
+            let curr = &reads[win[1]];
+
+            // Retrieve overlap info from graph
+            let edges = graph.get(&win[0]).unwrap();
+            let edge = edges.iter().find(|e| e.target_id == win[1]).unwrap();
+
+            match align_and_merge(&contig_seq, &curr.seq, edge.overlap_len, &merge_params) {
+                Ok(merged) => contig_seq = merged,
+                Err(e) => warn!("Alignment failed between {} and {}: {}", prev.id, curr.id, e),
+            }
+        }
+
+        contig_idx += 1;
+        total_bases += contig_seq.len();
+        writeln!(output, ">Soul_Contig_{} length={}", contig_idx, contig_seq.len())?;
+        output.write_all(&contig_seq)?;
+        output.write_all(b"\n")?;
+
+        for nid in path {
+            visited.insert(nid);
+        }
     }
 
-    // Write Links (Edges)
-    for r in edges.iter() {
-        let (id_a, id_b) = r.key();
-        let (len, dir_a, dir_b) = r.value();
-        let name_a = &processed_reads[*id_a].name;
-        let name_b = &processed_reads[*id_b].name;
-        
-        // GFA Link: L <SegA> <DirA> <SegB> <DirB> <CIGAR>
-        // We use 'M' to denote the overlap length.
-        writeln!(writer, "L\t{}\t{}\t{}\t{}\t{}M", name_a, dir_a, name_b, dir_b, len)?;
-    }
+    info!("Assembly complete: {} contigs, total {} bp -> {:?}", contig_idx, total_bases, args.output);
 
-    info!("Soul pipeline completed successfully.");
     Ok(())
 }
