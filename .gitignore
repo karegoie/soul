@@ -1,4 +1,7 @@
 target/
+.venv/
 Cargo.lock
 *.fastq
 *.fasta
+*.gfa
+*.log
