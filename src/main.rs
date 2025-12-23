@@ -292,7 +292,7 @@ fn main() -> Result<()> {
             if read_a.id >= read_b_id { continue; }
 
             let read_b = &processed_reads[read_b_id];
-            let mut max_bp_len = 0;
+            let mut overlaps = Vec::new();
             
             // Check all channels to find the strongest support for this overlap
             for ch_idx in 0..channels.len() {
@@ -306,20 +306,59 @@ fn main() -> Result<()> {
                     args.min_rhythm_len, 
                     args.tolerance
                 ) {
-                    if bp_len > max_bp_len {
-                        max_bp_len = bp_len;
-                    }
+                    overlaps.push(bp_len);
                 }
             }
 
-            if max_bp_len > 0 {
+            if overlaps.is_empty() { continue; }
+
+            // Consensus Logic: Filter out noise by requiring multiple channels to agree
+            overlaps.sort_unstable();
+
+            let mut best_cluster_len = 0;
+            let mut best_cluster_count = 0;
+            
+            let mut current_cluster_sum = 0;
+            let mut current_cluster_count = 0;
+            let mut current_cluster_start_val = overlaps[0];
+
+            for &val in &overlaps {
+                // Allow 5% difference relative to the cluster start or 50bp
+                let diff = val.abs_diff(current_cluster_start_val);
+                let threshold = (current_cluster_start_val / 20).max(50); 
+
+                if diff <= threshold {
+                    current_cluster_sum += val;
+                    current_cluster_count += 1;
+                } else {
+                    // Check if this cluster is the best so far
+                    if current_cluster_count > best_cluster_count {
+                        best_cluster_count = current_cluster_count;
+                        best_cluster_len = current_cluster_sum / current_cluster_count;
+                    }
+                    
+                    // Start new cluster
+                    current_cluster_start_val = val;
+                    current_cluster_sum = val;
+                    current_cluster_count = 1;
+                }
+            }
+            
+            // Check last cluster
+            if current_cluster_count > best_cluster_count {
+                best_cluster_count = current_cluster_count;
+                best_cluster_len = current_cluster_sum / current_cluster_count;
+            }
+
+            // Require at least 3 channels to agree to accept the overlap
+            if best_cluster_count >= 3 {
                 // Determine orientation characters for GFA
                 // Read A is always Forward (+).
                 // If matched Strand B is Forward, it implies A+ overlaps B+.
                 // If matched Strand B is Reverse, it implies A+ overlaps B-.
                 let dir_b = if strand_b == Strand::Forward { '+' } else { '-' };
                 
-                edges.insert((read_a.id, read_b_id), (max_bp_len, '+', dir_b));
+                edges.insert((read_a.id, read_b_id), (best_cluster_len, '+', dir_b));
                 overlap_count.fetch_add(1, Ordering::Relaxed);
             }
         }
